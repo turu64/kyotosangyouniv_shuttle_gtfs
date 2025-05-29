@@ -1,0 +1,2 @@
+# kyotosangyouniv_shuttle_gtfs
+京都産業大学のシャトルバスの非公式GTFS-JPデータ
