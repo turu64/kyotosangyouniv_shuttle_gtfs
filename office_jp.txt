@@ -1,0 +1,3 @@
+office_id,office_name,office_url,office_phone
+0001,高野営業所,,075-791-2181
+0002,嵐山営業所,,075-861-2105
