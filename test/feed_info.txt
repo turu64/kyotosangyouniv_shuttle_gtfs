@@ -1,2 +1,0 @@
-feed_publisher_name,feed_publisher_url,feed_lang,feed_start_date,feed_end_date,feed_version
-つるたる@0c103a,https://blog.turutaru.com,ja,20250401,20250831,20250601

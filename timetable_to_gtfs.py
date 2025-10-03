@@ -16,6 +16,22 @@ from typing import List, Dict, Tuple
 import os
 import shutil
 import requests
+try:
+    import pdfplumber  # PDFテキスト抽出
+except Exception:
+    pdfplumber = None
+try:
+    import camelot  # 表抽出（Ghostscript等が必要）
+except Exception:
+    camelot = None
+try:
+    from pdf2image import convert_from_bytes  # OCR用に画像化
+except Exception:
+    convert_from_bytes = None
+try:
+    import pytesseract  # OCR
+except Exception:
+    pytesseract = None
 
 
 class TimetableParser:
@@ -89,7 +105,8 @@ class TimetableParser:
             # 方向を決定（テキスト優先、判別不可なら偶奇でフォールバック）
             if "大学発" in text:
                 direction = 0
-            elif "神社発" in text:
+            elif ("発" in text) and ("大学発" not in text):
+                # 「大学発」以外の「〜発」（例: 神社発/二軒茶屋駅発 など）は対向側
                 direction = 1
             else:
                 direction = 0 if (i % 2 == 0) else 1
@@ -376,26 +393,340 @@ ROUTE_CONFIGS = {
 }
 
 
+HARDCODED_URLS = {
+    '50000': 'https://www.kyoto-su.ac.jp/bus/kamigamo/',
+    '50002': 'https://www.kyoto-su.ac.jp/bus/niken/',
+}
+
+# 臨時ダイヤ機能（PDF/OCR）は一旦無効化
+SPECIAL_SCHEDULES = []
+
+# OCR実行時の設定（mainで更新）
+OCR_CONFIG = {
+    'tesseract_cmd': None,
+    'poppler_path': None,
+    'lang': 'jpn+eng',
+}
+
+
+def save_gtfs_files(trips: List[Dict], stop_times: List[Dict], output_dir: str) -> None:
+    """与えられた trips / stop_times をGTFSファイルとして保存する。"""
+    os.makedirs(output_dir, exist_ok=True)
+    trips_path = os.path.join(output_dir, 'trips.txt')
+    with open(trips_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            'route_id', 'service_id', 'trip_id', 'trip_headsign',
+            'direction_id', 'block_id', 'shape_id',
+            'wheelchair_accessible', 'bikes_allowed'
+        ])
+        writer.writeheader()
+        writer.writerows(trips)
+
+    stop_times_path = os.path.join(output_dir, 'stop_times.txt')
+    with open(stop_times_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            'trip_id', 'arrival_time', 'departure_time', 'stop_id',
+            'stop_sequence', 'stop_headsign', 'pickup_type',
+            'drop_off_type', 'shape_dist_traveled', 'timepoint'
+        ])
+        writer.writeheader()
+        writer.writerows(stop_times)
+
+    print(f"Generated {len(trips)} trips and {len(stop_times)} stop times")
+    print(f"Files saved: {trips_path}, {stop_times_path}")
+
+
+def _append_calendar_dates(output_dir: str, rows: List[Dict[str, str]]) -> None:
+    path = os.path.join(output_dir, 'calendar_dates.txt')
+    # 既存ヘッダーを確認しつつ追記（なければ新規作成）
+    exists = os.path.isfile(path)
+    with open(path, 'a', newline='', encoding='utf-8') as f:
+        fieldnames = ['service_id', 'date', 'exception_type']
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        for r in rows:
+            writer.writerow({
+                'service_id': r['service_id'],
+                'date': r['date'],
+                'exception_type': r['exception_type'],
+            })
+
+
+def _extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+    if not pdfplumber:
+        print('Warning: pdfplumber is not available. Skipping special PDF parsing.')
+        return ''
+    try:
+        from io import BytesIO
+        text_all = []
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                text_all.append(page.extract_text() or '')
+        return "\n".join(text_all)
+    except Exception as e:
+        print(f'Warning: failed to parse PDF: {e}')
+        return ''
+
+
+def _extract_text_via_ocr(pdf_bytes: bytes) -> str:
+    """OCRでPDFからテキストを抽出（画像ベースPDF向け）。"""
+    if not convert_from_bytes or not pytesseract:
+        print('Warning: OCR dependencies not available (pdf2image/pytesseract).')
+        return ''
+    try:
+        # tesseractコマンドの明示指定
+        if OCR_CONFIG.get('tesseract_cmd'):
+            pytesseract.pytesseract.tesseract_cmd = OCR_CONFIG['tesseract_cmd']
+        # popplerのパス指定（Windowsで必須）
+        poppler_path = OCR_CONFIG.get('poppler_path')
+        if poppler_path:
+            images = convert_from_bytes(pdf_bytes, dpi=300, poppler_path=poppler_path)
+        else:
+            images = convert_from_bytes(pdf_bytes, dpi=300)
+        texts = []
+        for img in images:
+            # 日本語+英数字想定
+            try:
+                text = pytesseract.image_to_string(img, lang=OCR_CONFIG.get('lang', 'jpn+eng'))
+            except Exception:
+                text = pytesseract.image_to_string(img)
+            texts.append(text or '')
+        return "\n".join(texts)
+    except Exception as e:
+        print(f'Warning: OCR extraction failed: {e}')
+        return ''
+
+
+def _parse_special_pdf_tables(pdf_bytes: bytes, route_id: str, config: Dict, special_service_id: str) -> Tuple[List[Dict], List[Dict]]:
+    """pdfplumberのテーブル抽出を使い、臨時ダイヤの表からtrips/stop_timesを生成する。"""
+    if not pdfplumber:
+        return [], []
+    from io import BytesIO
+    parser_inst = TimetableParser(route_id, config)
+    try:
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables() or []
+                for table in tables:
+                    if not table or len(table) < 2:
+                        continue
+                    # ヘッダー行を探す
+                    header = table[0]
+                    header_texts = [(h or '').strip() for h in header]
+                    # 対応語彙
+                    univ_keywords = ['大学発', '産業大学発', '本学発']
+                    other_keywords = ['神社発', '上賀茂神社発', '二軒茶屋駅発', '二軒茶屋発']
+                    # ヘッダーに大学側の語が含まれるか確認
+                    if not any(any(k in h for k in univ_keywords) for h in header_texts):
+                        continue
+                    # 大学発列を特定
+                    univ_col = None
+                    for i, h in enumerate(header_texts):
+                        if any(k in h for k in univ_keywords):
+                            univ_col = i
+                            break
+                    if univ_col is None:
+                        continue
+                    # 対向列を特定（明示語優先、なければ右隣）
+                    other_col = None
+                    for i, h in enumerate(header_texts):
+                        if any(k in h for k in other_keywords):
+                            other_col = i
+                            break
+                    if other_col is None:
+                        other_col = univ_col + 1 if univ_col + 1 < len(header_texts) else None
+                    # 行を処理
+                    for row in table[1:]:
+                        cells = [(c or '').strip() for c in row]
+                        if not cells:
+                            continue
+                        hour_str = (cells[0] if len(cells) > 0 else '').strip()
+                        if not re.match(r'^\d{1,2}$', hour_str):
+                            continue
+                        hour = int(hour_str)
+                        # 大学発
+                        if univ_col is not None and univ_col < len(cells):
+                            td = cells[univ_col]
+                            if td:
+                                pattern = {'index': 0, 'service_id': special_service_id, 'direction': 0}
+                                parser_inst._parse_times(td, hour, pattern)
+                        # 対向列
+                        if other_col is not None and other_col < len(cells):
+                            td = cells[other_col]
+                            if td:
+                                pattern = {'index': 1, 'service_id': special_service_id, 'direction': 1}
+                                parser_inst._parse_times(td, hour, pattern)
+    except Exception as e:
+        print(f'Warning: table extraction failed: {e}')
+        return [], []
+    return parser_inst.trips, parser_inst.stop_times
+
+
+def _parse_special_pdf_camelot(pdf_bytes: bytes, route_id: str, config: Dict, special_service_id: str) -> Tuple[List[Dict], List[Dict]]:
+    """Camelotを使って表抽出し、臨時ダイヤを生成する。"""
+    if not camelot:
+        return [], []
+    from io import BytesIO
+    import tempfile
+    parser_inst = TimetableParser(route_id, config)
+    try:
+        # Camelotはファイルパス入力を想定するため一時ファイルに保存
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=True) as tmp:
+            tmp.write(pdf_bytes)
+            tmp.flush()
+            # lattice/stream 双方を試す
+            tables = []
+            try:
+                tables = camelot.read_pdf(tmp.name, flavor='lattice', pages='all')
+            except Exception:
+                tables = []
+            if not tables:
+                try:
+                    tables = camelot.read_pdf(tmp.name, flavor='stream', pages='all')
+                except Exception:
+                    tables = []
+            for t in tables or []:
+                df = t.df  # pandas DataFrame
+                if df.shape[0] < 2 or df.shape[1] < 3:
+                    continue
+                # 先頭行をヘッダーとして扱う
+                header = [str(x).strip() for x in df.iloc[0].tolist()]
+                univ_keywords = ['大学発', '産業大学発', '本学発']
+                other_keywords = ['神社発', '上賀茂神社発', '二軒茶屋駅発', '二軒茶屋発']
+                if not any(any(k in h for k in univ_keywords) for h in header):
+                    continue
+                univ_col = None
+                for i, h in enumerate(header):
+                    if any(k in h for k in univ_keywords):
+                        univ_col = i
+                        break
+                if univ_col is None:
+                    continue
+                other_col = None
+                for i, h in enumerate(header):
+                    if any(k in h for k in other_keywords):
+                        other_col = i
+                        break
+                if other_col is None:
+                    other_col = univ_col + 1 if univ_col + 1 < len(header) else None
+                # データ行を処理
+                for r in range(1, df.shape[0]):
+                    row = [str(x).strip() for x in df.iloc[r].tolist()]
+                    if not row:
+                        continue
+                    hour_str = row[0] if len(row) > 0 else ''
+                    if not re.match(r'^\d{1,2}$', hour_str):
+                        continue
+                    hour = int(hour_str)
+                    if univ_col is not None and univ_col < len(row):
+                        td = row[univ_col]
+                        if td:
+                            parser_inst._parse_times(td, hour, {'index': 0, 'service_id': special_service_id, 'direction': 0})
+                    if other_col is not None and other_col < len(row):
+                        td = row[other_col]
+                        if td:
+                            parser_inst._parse_times(td, hour, {'index': 1, 'service_id': special_service_id, 'direction': 1})
+    except Exception as e:
+        print(f'Warning: camelot extraction failed: {e}')
+        return [], []
+    return parser_inst.trips, parser_inst.stop_times
+
+
+def _parse_special_pdf_text(text: str, route_id: str, config: Dict, special_service_id: str) -> Tuple[List[Dict], List[Dict]]:
+    """臨時ダイヤPDFのテキストを簡易解析し、trips/stop_times を返す。
+
+    想定フォーマット: 行頭に時、以降に「大学発」「対向側（〜発）」の2列相当の時分データが2空白以上で区切られて並ぶ。
+    例: "8 10・以降5～10分間隔    00・05・10・以降5～10分間隔"
+    """
+    parser_inst = TimetableParser(route_id, config)
+    lines = text.split('\n')
+    for raw in lines:
+        line = raw.strip()
+        if not re.match(r'^\d{1,2}\s+', line):
+            continue
+        parts = re.split(r'\s{2,}', line)
+        if len(parts) < 2:
+            continue
+        try:
+            hour = int(parts[0])
+        except ValueError:
+            continue
+        # 2列想定（不足分は空文字）
+        columns = parts[1:3]
+        service_patterns = [
+            {'index': 0, 'service_id': special_service_id, 'direction': 0},  # 大学発
+            {'index': 1, 'service_id': special_service_id, 'direction': 1},  # 対向
+        ]
+        for i, time_data in enumerate(columns):
+            if not time_data or not time_data.strip():
+                continue
+            pattern = service_patterns[i]
+            parser_inst._parse_times(time_data.strip(), hour, pattern)
+    return parser_inst.trips, parser_inst.stop_times
+
+
+def apply_special_schedules(output_dir: str, base_trips: List[Dict], base_stop_times: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    # 無効化中: そのまま返す
+    return base_trips, base_stop_times
+
+
 def main():
     parser = argparse.ArgumentParser(description='HTML時刻表からGTFSデータを生成')
     parser.add_argument('--input', '-i', help='入力HTMLファイルまたはURL')
-    parser.add_argument('--route-id', '-r', required=True, help='route_id (例: 50000)')
+    parser.add_argument('--route-id', '-r', help='route_id (例: 50000)。未指定または"all"で両路線生成')
     parser.add_argument('--output-dir', '-o', default='.', help='出力ディレクトリ')
     parser.add_argument('--url', '-u', help='時刻表のURL（--inputの代わりに使用）')
+    # OCR / PDF抽出関連
+    parser.add_argument('--tesseract-cmd', help='tesseract.exe へのフルパス（OCR用）')
+    parser.add_argument('--poppler-path', help='poppler のbinディレクトリへのパス（pdf2image用）')
+    parser.add_argument('--ocr-lang', default='jpn+eng', help='OCR言語（例: jpn, eng, jpn+eng）')
     
     args = parser.parse_args()
     
-    # 入力ソースの確認
-    if not args.input and not args.url:
-        print("Error: --input または --url のいずれかを指定してください")
+    # OCR設定の反映
+    if args.tesseract_cmd:
+        OCR_CONFIG['tesseract_cmd'] = args.tesseract_cmd
+    if args.poppler_path:
+        OCR_CONFIG['poppler_path'] = args.poppler_path
+    if args.ocr_lang:
+        OCR_CONFIG['lang'] = args.ocr_lang
+
+    # 両路線（上賀茂+二軒茶屋）同時生成モード
+    if (not args.input and not args.url) and (not args.route_id or args.route_id.lower() == 'all'):
+        combined_trips: List[Dict] = []
+        combined_stop_times: List[Dict] = []
+
+        targets = ['50000', '50002']
+        for rid in targets:
+            if rid not in ROUTE_CONFIGS:
+                print(f"Warning: Unknown route_id in combined mode: {rid}")
+                continue
+            if rid not in HARDCODED_URLS:
+                print(f"Warning: No hardcoded URL for route_id: {rid}")
+                continue
+            print(f"Fetching from URL: {HARDCODED_URLS[rid]} (route_id={rid})")
+            response = requests.get(HARDCODED_URLS[rid])
+            response.encoding = 'utf-8'
+            html_content = response.text
+
+            config = ROUTE_CONFIGS[rid]
+            parser_inst = TimetableParser(rid, config)
+            parser_inst.parse_html(html_content)
+            combined_trips.extend(parser_inst.trips)
+            combined_stop_times.extend(parser_inst.stop_times)
+
+        # ベースファイルコピーと保存（臨時ダイヤ適用は無効化）
+        base_dir = os.path.join(os.path.dirname(__file__), 'gtfs-basefiles')
+        copy_base_gtfs_files(base_dir, args.output_dir)
+        save_gtfs_files(combined_trips, combined_stop_times, args.output_dir)
         return
     
     # ルート設定を取得
     if args.route_id not in ROUTE_CONFIGS:
         print(f"Error: Unknown route_id: {args.route_id}")
-        print(f"Available route_ids: {', '.join(ROUTE_CONFIGS.keys())}")
+        print(f"Available route_ids: {', '.join(ROUTE_CONFIGS.keys())} or 'all' for combined mode")
         return
-    
     config = ROUTE_CONFIGS[args.route_id]
     
     # HTMLコンテンツを取得
@@ -405,19 +736,26 @@ def main():
         response.encoding = 'utf-8'
         html_content = response.text
     else:
-        # HTMLファイルを読み込み
-        with open(args.input, 'r', encoding='utf-8') as f:
-            html_content = f.read()
+        # 入力未指定かつハードコードURLがある場合はそれを使用
+        if (not args.input) and (args.route_id in HARDCODED_URLS):
+            url = HARDCODED_URLS[args.route_id]
+            print(f"Fetching from URL (hardcoded): {url}")
+            response = requests.get(url)
+            response.encoding = 'utf-8'
+            html_content = response.text
+        else:
+            # HTMLファイルを読み込み
+            with open(args.input, 'r', encoding='utf-8') as f:
+                html_content = f.read()
     
     # 解析と変換
     parser = TimetableParser(args.route_id, config)
     parser.parse_html(html_content)
 
-    # 既定のベースファイルディレクトリ（リポジトリ直下）
+    # 既定のベースファイルディレクトリ（臨時ダイヤ適用は無効化）
     base_dir = os.path.join(os.path.dirname(__file__), 'gtfs-basefiles')
     copy_base_gtfs_files(base_dir, args.output_dir)
-
-    parser.save_gtfs(args.output_dir)
+    save_gtfs_files(parser.trips, parser.stop_times, args.output_dir)
 
 
 if __name__ == '__main__':

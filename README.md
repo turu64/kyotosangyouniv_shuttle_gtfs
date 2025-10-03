@@ -40,7 +40,7 @@ python -m pip install beautifulsoup4 requests
 
 ### 使い方（`timetable_to_gtfs.py`）
 
-大学サイトの時刻表URLから直接生成するか、ローカルに保存したHTMLから生成できます。
+大学サイトの時刻表URLから直接生成するか、ローカルに保存したHTMLから生成できます。引数未指定または `--route-id all` の場合は、ハードコードされたURLから上賀茂（50000）と二軒茶屋（50002）をまとめて生成します。
 
 - **URLから生成**
 
@@ -50,6 +50,20 @@ python timetable_to_gtfs.py --url https://www.kyoto-su.ac.jp/bus/kamigamo/ --rou
 バージョン管理をして作成する例（--output-dirのあとのディレクトリの名前を変更しておく）：
 ```powershell
 python timetable_to_gtfs.py --url https://www.kyoto-su.ac.jp/bus/kamigamo/ --route-id 50000 --output-dir ./20250929
+```
+
+二軒茶屋シャトル（`--route-id 50002`）の例:
+
+```powershell
+python timetable_to_gtfs.py --url https://www.kyoto-su.ac.jp/bus/niken/ --route-id 50002 --output-dir ./20250929-niken
+```
+
+- **両路線を一括で生成（引数未指定 or `--route-id all`）**
+
+```powershell
+python timetable_to_gtfs.py --output-dir ./20250929-all
+# もしくは
+python timetable_to_gtfs.py --route-id all --output-dir ./20250929-all
 ```
 
 - **ローカルHTMLから生成**

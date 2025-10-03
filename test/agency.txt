@@ -1,2 +1,0 @@
-agency_id,agency_name,agency_url,agency_timezone,agency_lang,agency_phone,agency_fare_url,agency_email
-5130005004301,京都産業大学,https://www.kyoto-su.ac.jp/,Asia/Tokyo,ja,075-705-1408,,soumu-ka@star.kyoto-su.ac.jp
