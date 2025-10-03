@@ -14,6 +14,7 @@ from bs4 import BeautifulSoup
 import re
 from typing import List, Dict, Tuple
 import os
+import shutil
 import requests
 
 
@@ -67,8 +68,8 @@ class TimetableParser:
                 day_info.append('unknown')
         
         # 方向セルと曜日セルを組み合わせてパターンを作成
-        col_index = 0
-        for i, cell in enumerate(direction_cells[1:]):  # 最初のセルは"大学発"
+        # 方向行の全セルを対象にし、データ列とインデックスを一致させる
+        for i, cell in enumerate(direction_cells):
             text = cell.get_text().strip()
             
             # 曜日情報を決定
@@ -85,16 +86,20 @@ class TimetableParser:
             else:
                 continue
             
-            # 方向を決定
-            direction = 0 if "大学発" in text else 1
+            # 方向を決定（テキスト優先、判別不可なら偶奇でフォールバック）
+            if "大学発" in text:
+                direction = 0
+            elif "神社発" in text:
+                direction = 1
+            else:
+                direction = 0 if (i % 2 == 0) else 1
             
             patterns.append({
-                'index': col_index,
+                'index': i,
                 'service_id': service_id,
                 'direction': direction,
                 'day_type': day_type
             })
-            col_index += 1
                 
         return patterns
     
@@ -265,6 +270,8 @@ class TimetableParser:
     
     def save_gtfs(self, output_dir: str = '.') -> None:
         """GTFSファイルを保存"""
+        # 出力先作成
+        os.makedirs(output_dir, exist_ok=True)
         # trips.txt
         trips_path = os.path.join(output_dir, 'trips.txt')
         with open(trips_path, 'w', newline='', encoding='utf-8') as f:
@@ -289,6 +296,32 @@ class TimetableParser:
         
         print(f"Generated {len(self.trips)} trips and {len(self.stop_times)} stop times")
         print(f"Files saved: {trips_path}, {stop_times_path}")
+
+
+def copy_base_gtfs_files(base_dir: str, output_dir: str) -> None:
+    """gtfs-basefiles ディレクトリから基本ファイルを出力先へコピーする。
+
+    trips.txt と stop_times.txt は生成物で上書きするためコピー対象から除外。
+    base_dir が存在しない場合は何もせずに戻る。
+    """
+    if not os.path.isdir(base_dir):
+        print(f"Warning: base files directory not found: {base_dir}")
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    exclude = {"trips.txt", "stop_times.txt"}
+    for entry in os.listdir(base_dir):
+        src = os.path.join(base_dir, entry)
+        dst = os.path.join(output_dir, entry)
+        if not os.path.isfile(src):
+            continue
+        if os.path.splitext(entry)[1].lower() != ".txt":
+            continue
+        if entry in exclude:
+            continue
+        shutil.copy2(src, dst)
+    print(f"Base GTFS files copied from {base_dir} to {output_dir}")
 
 
 # ルート設定
@@ -379,6 +412,11 @@ def main():
     # 解析と変換
     parser = TimetableParser(args.route_id, config)
     parser.parse_html(html_content)
+
+    # 既定のベースファイルディレクトリ（リポジトリ直下）
+    base_dir = os.path.join(os.path.dirname(__file__), 'gtfs-basefiles')
+    copy_base_gtfs_files(base_dir, args.output_dir)
+
     parser.save_gtfs(args.output_dir)
 
 
